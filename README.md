@@ -10,7 +10,8 @@ When you download, know that .html is a file that will run SnapMark in you web b
 
 How to use:
 
-<img width="944" height="829" alt="Screenshot 2026-10-01 at 6 23 25 PM" src="https://github.com/user-attachments/assets/e69579a6-9d16-4cb7-b5c8-f4e91da24125" />
+<img width="846" height="367" alt="Screenshot 2026-10-01 at 6 43 50 PM" src="https://github.com/user-attachments/assets/27462ad4-f4cf-47a0-a2d8-2330a8b424c0" />
+
 
 Its self explanatory when you look at it, and is easy to learn.
 
