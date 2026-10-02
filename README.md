@@ -30,4 +30,4 @@ Then there’s “Color, Line, and Canvas”
 
 “Export PNG” is how you export your final render.
 
-Feedback is appreciated. <img width="944" height="829" alt="Screenshot 2026-10-01 at 6 23 25 PM" src="https://github.com/user-attachments/assets/b356a646-9b57-474e-acbe-f4e67fd1bf02" />
+Feedback is appreciated. 
