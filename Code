@@ -1,0 +1,1345 @@
+import copy
+import json
+import math
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QCheckBox,
+    QColorDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QSlider,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+CANVAS_SIZE = 1024
+COLOR_FILE = Path.home() / ".snapmark" / "colors.json"
+
+
+def endpoints(line):
+    angle = math.radians(line["angle"])
+    dx = math.cos(angle) * line["length"] / 2
+    dy = math.sin(angle) * line["length"] / 2
+
+    return [
+        QPointF(line["x"] - dx, line["y"] - dy),
+        QPointF(line["x"] + dx, line["y"] + dy),
+    ]
+
+
+def distance(a, b):
+    return math.hypot(a.x() - b.x(), a.y() - b.y())
+
+
+def set_endpoints(line, a, b):
+    line["x"] = (a.x() + b.x()) / 2
+    line["y"] = (a.y() + b.y()) / 2
+    line["length"] = max(1, distance(a, b))
+    line["angle"] = math.degrees(
+        math.atan2(b.y() - a.y(), b.x() - a.x())
+    )
+
+
+def connected_lines(lines, selected_id):
+    group = {selected_id}
+
+    while True:
+        added = set()
+
+        for first in lines:
+            if first["id"] not in group or first.get("kind") == "circle":
+                continue
+
+            for second in lines:
+                if (
+                    second.get("kind") == "circle"
+                    or second["id"] in group
+                    or second["hidden"]
+                    or second["locked"]
+                ):
+                    continue
+
+                if any(
+                    distance(a, b) < 0.1
+                    for a in endpoints(first)
+                    for b in endpoints(second)
+                ):
+                    added.add(second["id"])
+
+        if not added:
+            return group
+
+        group.update(added)
+
+
+def closed_shapes(lines):
+    """Find closed loops made from connected line endpoints."""
+    vertices = []
+    edges = []
+
+    def vertex_index(point):
+        for index, existing in enumerate(vertices):
+            if distance(point, existing) < 2:
+                return index
+
+        vertices.append(point)
+        return len(vertices) - 1
+
+    for line in lines:
+        if line.get("kind") == "circle" or line["hidden"] or line["length"] <= 2:
+            continue
+
+        a, b = endpoints(line)
+        edges.append(
+            (line["id"], vertex_index(a), vertex_index(b))
+        )
+
+    adjacency = [[] for _ in vertices]
+
+    for index, (_, a, b) in enumerate(edges):
+        adjacency[a].append(index)
+        adjacency[b].append(index)
+
+    found = {}
+
+    def walk(start, node, path, used_edges, visited):
+        # Keep complex drawings from generating excessive combinations.
+        if len(path) > 12:
+            return
+
+        for edge_index in adjacency[node]:
+            if edge_index in used_edges:
+                continue
+
+            _, a, b = edges[edge_index]
+            next_node = b if a == node else a
+
+            if next_node == start and len(path) >= 2:
+                cycle = path + [edge_index]
+                key = "-".join(
+                    str(value)
+                    for value in sorted(edges[i][0] for i in cycle)
+                )
+
+                if key in found:
+                    continue
+
+                points = [vertices[i] for i in visited]
+                area = abs(
+                    sum(
+                        point.x() * points[(i + 1) % len(points)].y()
+                        - point.y() * points[(i + 1) % len(points)].x()
+                        for i, point in enumerate(points)
+                    )
+                ) / 2
+
+                if area > 20:
+                    found[key] = (key, points, area)
+
+            elif next_node not in visited:
+                walk(
+                    start,
+                    next_node,
+                    path + [edge_index],
+                    used_edges | {edge_index},
+                    visited + [next_node],
+                )
+
+    for index in range(len(vertices)):
+        walk(index, index, [], set(), [index])
+
+    return list(found.values())
+
+
+def polygon_path(points):
+    path = QPainterPath(points[0])
+
+    for point in points[1:]:
+        path.lineTo(point)
+
+    path.closeSubpath()
+    return path
+
+
+class ColorWheel(QWidget):
+    def __init__(self, color):
+        super().__init__()
+        self.setFixedSize(240, 240)
+        self.hue = max(0, color.hsvHueF())
+        self.saturation = color.hsvSaturationF()
+        self.value = color.valueF()
+        self.changed = lambda: None
+        self.started = lambda: None
+        self.wheel = QImage(240, 240, QImage.Format.Format_ARGB32)
+        self.wheel.fill(Qt.GlobalColor.transparent)
+        for y in range(240):
+            for x in range(240):
+                dx, dy = x - 120, y - 120
+                saturation = math.hypot(dx, dy) / 116
+                if saturation <= 1:
+                    hue = (math.atan2(dy, dx) / (2 * math.pi)) % 1
+                    self.wheel.setPixelColor(x, y, QColor.fromHsvF(hue, saturation, 1))
+
+    def color(self):
+        return QColor.fromHsvF(self.hue, self.saturation, self.value)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.scale(self.width() / 240, self.height() / 240)
+        painter.drawImage(0, 0, self.wheel)
+        a = self.hue * 2 * math.pi
+        point = QPointF(120 + math.cos(a) * self.saturation * 116,
+                        120 + math.sin(a) * self.saturation * 116)
+        painter.setPen(QPen(QColor("#101116"), 5))
+        painter.drawEllipse(point, 6, 6)
+        painter.setPen(QPen(QColor("white"), 2))
+        painter.drawEllipse(point, 6, 6)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.started()
+            self.pick(event.position())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self.pick(event.position())
+
+    def pick(self, point):
+        dx, dy = point.x() * 240 / self.width() - 120, point.y() * 240 / self.height() - 120
+        self.hue = (math.atan2(dy, dx) / (2 * math.pi)) % 1
+        self.saturation = min(1, math.hypot(dx, dy) / 116)
+        self.update()
+        self.changed()
+
+
+def choose_wheel_color(initial, parent, title):
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    layout = QVBoxLayout(dialog)
+    wheel = ColorWheel(initial)
+    layout.addWidget(wheel, alignment=Qt.AlignmentFlag.AlignCenter)
+    layout.addWidget(QLabel("Brightness"))
+    brightness = QSlider(Qt.Orientation.Horizontal)
+    brightness.setRange(0, 100)
+    brightness.setValue(round(wheel.value * 100))
+    layout.addWidget(brightness)
+    preview = QLabel()
+    preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    preview.setMinimumHeight(36)
+    layout.addWidget(preview)
+    def update_preview():
+        color = wheel.color()
+        preview.setText(color.name().upper())
+        ink = "#101116" if color.lightnessF() > .5 else "white"
+        preview.setStyleSheet(f"background: {color.name()}; color: {ink}; border-radius: 6px;")
+    def set_brightness(value):
+        wheel.value = value / 100
+        update_preview()
+    wheel.changed = update_preview
+    brightness.valueChanged.connect(set_brightness)
+    update_preview()
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    layout.addWidget(buttons)
+    return wheel.color() if dialog.exec() == QDialog.DialogCode.Accepted else QColor()
+
+
+class Canvas(QWidget):
+    def __init__(self, editor):
+        super().__init__()
+        self.editor = editor
+        self.mode = "select"
+        self.drag = None
+
+        self.setMinimumSize(360, 360)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def transform(self):
+        scale = min(
+            (self.width() - 30) / CANVAS_SIZE,
+            (self.height() - 30) / CANVAS_SIZE,
+        )
+
+        return (
+            scale,
+            (self.width() - CANVAS_SIZE * scale) / 2,
+            (self.height() - CANVAS_SIZE * scale) / 2,
+        )
+
+    def canvas_point(self, event):
+        scale, offset_x, offset_y = self.transform()
+        point = event.position()
+
+        return QPointF(
+            max(0, min(CANVAS_SIZE, (point.x() - offset_x) / scale)),
+            max(0, min(CANVAS_SIZE, (point.y() - offset_y) / scale)),
+        )
+
+    def snap(self, point, excluded_ids):
+        best = point
+        threshold = 14 / self.transform()[0]
+
+        for line in self.editor.lines:
+            if line.get("kind") == "circle" or line["hidden"] or line["id"] in excluded_ids:
+                continue
+
+            for endpoint in endpoints(line):
+                amount = distance(point, endpoint)
+
+                if amount < threshold:
+                    best = endpoint
+                    threshold = amount
+
+        return best
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#101116"))
+
+        scale, offset_x, offset_y = self.transform()
+        painter.translate(offset_x, offset_y)
+        painter.scale(scale, scale)
+
+        self.draw_logo(painter, preview=True)
+        painter.end()
+
+    def draw_logo(self, painter, preview=False):
+        editor = self.editor
+        painter.save()
+        painter.setClipRect(QRectF(0, 0, CANVAS_SIZE, CANVAS_SIZE))
+
+        if editor.transparent:
+            if preview:
+                painter.fillRect(
+                    QRectF(0, 0, CANVAS_SIZE, CANVAS_SIZE),
+                    QColor("white"),
+                )
+
+                for y in range(0, CANVAS_SIZE, 64):
+                    for x in range(0, CANVAS_SIZE, 64):
+                        if (x // 64 + y // 64) % 2:
+                            painter.fillRect(
+                                QRectF(x, y, 64, 64),
+                                QColor("#dddfe4"),
+                            )
+        else:
+            painter.fillRect(
+                QRectF(0, 0, CANVAS_SIZE, CANVAS_SIZE),
+                QColor(editor.background),
+            )
+
+        for key, points, _ in closed_shapes(editor.lines):
+            if key in editor.fills:
+                painter.fillPath(
+                    polygon_path(points),
+                    QColor(editor.fills[key]),
+                )
+
+        for line in editor.lines:
+            if line["hidden"]:
+                continue
+
+            cap = (
+                Qt.PenCapStyle.RoundCap
+                if line["rounded"]
+                else Qt.PenCapStyle.FlatCap
+            )
+
+            painter.setPen(
+                QPen(
+                    QColor(line["color"]),
+                    line["width"],
+                    Qt.PenStyle.SolidLine,
+                    cap,
+                )
+            )
+
+            if line.get("kind") == "circle":
+                painter.setBrush(QColor(line["fill"]) if line.get("fill") else Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QPointF(line["x"], line["y"]), line["length"] / 2, line["length"] / 2)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            else:
+                a, b = endpoints(line)
+                painter.drawLine(a, b)
+
+        line = editor.current()
+
+        if (
+            preview
+            and line
+            and not line["hidden"]
+            and not line["locked"]
+            and line.get("kind") != "circle"
+        ):
+            painter.setPen(QPen(QColor("#426cf5"), 4))
+            painter.setBrush(QColor("white"))
+
+            for point in endpoints(line):
+                painter.drawEllipse(point, 12, 12)
+
+        painter.restore()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        self.setFocus()
+        point = self.canvas_point(event)
+        editor = self.editor
+
+        if self.mode == "paint":
+            for shape in reversed(editor.lines):
+                if shape.get("kind") == "circle" and not shape["hidden"] and not shape["locked"] and distance(point, QPointF(shape["x"], shape["y"])) <= shape["length"] / 2:
+                    editor.remember()
+                    shape["fill"] = editor.fill_color
+                    editor.refresh()
+                    return
+            matches = [
+                (key, area)
+                for key, points, area in closed_shapes(editor.lines)
+                if polygon_path(points).contains(point)
+            ]
+
+            if matches:
+                key = min(matches, key=lambda item: item[1])[0]
+                editor.remember()
+                editor.fills[key] = editor.fill_color
+                editor.status.setText("Shape filled.")
+                editor.refresh()
+            else:
+                editor.status.setText(
+                    "Connect the endpoints to make a closed shape first."
+                )
+
+            return
+
+        if self.mode == "draw":
+            editor.remember()
+            point = self.snap(point, set())
+            line = editor.new_line(point.x(), point.y(), 1)
+            self.drag = ("draw", line["id"], point)
+            return
+
+        line = editor.current()
+
+        if line and not line["locked"] and not line["hidden"] and line.get("kind") != "circle":
+            ends = endpoints(line)
+
+            for index, endpoint in enumerate(ends):
+                if distance(point, endpoint) < 14 / self.transform()[0]:
+                    editor.remember()
+                    self.drag = (
+                        "endpoint",
+                        line["id"],
+                        index,
+                        ends[1 - index],
+                    )
+                    return
+
+        for line in reversed(editor.lines):
+            if line["hidden"] or line["locked"]:
+                continue
+
+            a, b = endpoints(line)
+            dx = b.x() - a.x()
+            dy = b.y() - a.y()
+
+            t = max(
+                0,
+                min(
+                    1,
+                    (
+                        (point.x() - a.x()) * dx
+                        + (point.y() - a.y()) * dy
+                    )
+                    / (dx * dx + dy * dy or 1),
+                ),
+            )
+
+            closest = QPointF(a.x() + t * dx, a.y() + t * dy)
+            threshold = max(
+                12 / self.transform()[0],
+                line["width"] / 2,
+            )
+
+            hit = distance(point, closest) <= threshold
+            if line.get("kind") == "circle":
+                radius_distance = distance(point, QPointF(line["x"], line["y"]))
+                hit = abs(radius_distance - line["length"] / 2) <= threshold or (bool(line.get("fill")) and radius_distance <= line["length"] / 2)
+            if hit:
+                editor.selected = line["id"]
+                editor.remember()
+
+                group = connected_lines(editor.lines, line["id"])
+                original = {
+                    item["id"]: (item["x"], item["y"])
+                    for item in editor.lines
+                    if item["id"] in group
+                }
+
+                self.drag = ("move", line["id"], point, original)
+                editor.refresh()
+                return
+
+        editor.selected = None
+        editor.refresh()
+
+    def mouseMoveEvent(self, event):
+        if not self.drag:
+            return
+
+        point = self.canvas_point(event)
+        kind, line_id, *details = self.drag
+        line = self.editor.by_id(line_id)
+
+        if line is None:
+            return
+
+        snapping = not (
+            event.modifiers() & Qt.KeyboardModifier.AltModifier
+        )
+
+        if kind == "draw":
+            if snapping:
+                point = self.snap(point, {line_id})
+
+            set_endpoints(line, details[0], point)
+
+        elif kind == "endpoint":
+            if snapping:
+                point = self.snap(point, {line_id})
+
+            index, fixed = details
+
+            if index == 0:
+                set_endpoints(line, point, fixed)
+            else:
+                set_endpoints(line, fixed, point)
+
+        else:
+            start, original = details
+            dx = point.x() - start.x()
+            dy = point.y() - start.y()
+
+            for item_id, (x, y) in original.items():
+                self.editor.by_id(item_id).update(x=x + dx, y=y + dy)
+
+            if snapping and line.get("kind") != "circle":
+                best = None
+                threshold = 14 / self.transform()[0]
+                ids = set(original)
+
+                for item_id in ids:
+                    for endpoint in endpoints(self.editor.by_id(item_id)):
+                        target = self.snap(endpoint, ids)
+                        amount = distance(endpoint, target)
+
+                        if target != endpoint and amount < threshold:
+                            best = (
+                                target.x() - endpoint.x(),
+                                target.y() - endpoint.y(),
+                            )
+                            threshold = amount
+
+                if best:
+                    for item_id in ids:
+                        moved = self.editor.by_id(item_id)
+                        moved["x"] += best[0]
+                        moved["y"] += best[1]
+
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if not self.drag:
+            return
+
+        if self.drag[0] == "draw":
+            line = self.editor.by_id(self.drag[1])
+
+            if line and line["length"] < 3:
+                self.editor.lines.remove(line)
+                self.editor.selected = None
+
+        self.drag = None
+        self.editor.refresh()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.editor.delete_line()
+        else:
+            super().keyPressEvent(event)
+
+
+class SnapMark(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SnapMark")
+        self.resize(1160, 800)
+        self.setMinimumSize(960, 720)
+
+        self.lines = []
+        self.fills = {}
+        self.history = []
+        self.selected = None
+        self.next_id = 1
+        self.background = "#ffffff"
+        self.transparent = False
+        self.fill_color = "#c2ff62"
+        self.updating = False
+
+        try:
+            saved = json.loads(COLOR_FILE.read_text())
+            self.saved_colors = [
+                color
+                for color in saved
+                if isinstance(color, str) and QColor(color).isValid()
+            ] if isinstance(saved, list) else []
+        except (OSError, ValueError):
+            self.saved_colors = []
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        central.setObjectName("app")
+        root = QVBoxLayout(central)
+        root.setContentsMargins(24, 18, 24, 18)
+        root.setSpacing(18)
+        header = QHBoxLayout()
+        brand = QLabel("S")
+        brand.setObjectName("brand")
+        brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.setFixedSize(38, 38)
+        header.addWidget(brand)
+        title = QLabel("SnapMark")
+        title.setObjectName("title")
+        header.addWidget(title)
+        subtitle = QLabel("Your lines. Your logo.")
+        subtitle.setObjectName("muted")
+        header.addWidget(subtitle)
+        header.addStretch()
+        self.button(header, "Open Project", self.open_project)
+        self.button(header, "Save Project", self.save_project)
+        self.button(header, "Undo", self.undo)
+        export = self.button(header, "Export PNG", self.export_png)
+        export.setObjectName("primary")
+        root.addLayout(header)
+        layout = QHBoxLayout()
+        layout.setSpacing(24)
+        root.addLayout(layout, 1)
+
+        left = QVBoxLayout()
+        layout.addLayout(left, 1)
+
+        tools = QHBoxLayout()
+        left.setSpacing(10)
+        left.addLayout(tools)
+
+        for title, action in [
+            ("Add line", self.add_line),
+            ("Add circle", self.add_circle),
+            ("Draw line", self.draw_mode),
+            ("Duplicate", self.duplicate),
+            ("Delete", self.delete_line),
+        ]:
+            self.button(tools, title, action)
+
+        tools2 = QHBoxLayout()
+        left.addLayout(tools2)
+        self.button(tools2, "Rotate left", lambda: self.rotate(-15))
+        self.button(tools2, "Rotate right", lambda: self.rotate(15))
+
+        self.paint_button = self.button(tools2, "Paint", self.paint_mode)
+        self.paint_button.setCheckable(True)
+        self.button(tools2, "Clear fills", self.clear_fills)
+
+        self.canvas = Canvas(self)
+        left.addWidget(self.canvas, 1)
+
+        self.status = QLabel("Add a line or draw one.")
+        self.status.setWordWrap(True)
+        self.status.setObjectName("muted")
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left.addWidget(self.status)
+
+        side_widget = QWidget()
+        side_widget.setFixedWidth(310)
+        side_widget.setObjectName("panel")
+        side = QVBoxLayout(side_widget)
+        side.setContentsMargins(16, 16, 16, 16)
+        side.setSpacing(10)
+        layout.addWidget(side_widget)
+
+        tabs = QTabWidget()
+        side.addWidget(tabs, 1)
+        layers_tab = QWidget()
+        layers_layout = QVBoxLayout(layers_tab)
+        section = QLabel("Layers")
+        section.setObjectName("section")
+        layers_layout.addWidget(section)
+
+        self.layer_list = QListWidget()
+        self.layer_list.setMinimumHeight(180)
+        self.layer_list.setSpacing(3)
+        self.layer_list.itemClicked.connect(self.select_layer)
+        layers_layout.addWidget(self.layer_list)
+
+        self.layer_name = QLineEdit()
+        self.layer_name.setPlaceholderText("Layer name")
+        self.layer_name.editingFinished.connect(self.rename_layer)
+        layers_layout.addWidget(self.layer_name)
+
+        layer_buttons = QHBoxLayout()
+        layers_layout.addLayout(layer_buttons)
+        self.button(layer_buttons, "Hide/Show", self.toggle_hidden)
+        self.button(layer_buttons, "Lock/Unlock", self.toggle_locked)
+
+        order_buttons = QHBoxLayout()
+        layers_layout.addLayout(order_buttons)
+        self.button(order_buttons, "Forward", lambda: self.reorder(1))
+        self.button(order_buttons, "Back", lambda: self.reorder(-1))
+
+        color_tab = QWidget()
+        color_layout = QVBoxLayout(color_tab)
+        color_layout.setSpacing(14)
+        tabs.addTab(color_tab, "Color")
+
+        self.wheel_fill = QCheckBox("Choose paint / fill color")
+        self.wheel_fill.toggled.connect(lambda _: self.refresh())
+        color_layout.addWidget(self.wheel_fill)
+        self.color_wheel = ColorWheel(QColor("#242738"))
+        self.color_wheel.setFixedSize(240, 240)
+        self.color_wheel.started = self.remember
+        self.color_wheel.changed = self.apply_inline_color
+        color_layout.addWidget(self.color_wheel, alignment=Qt.AlignmentFlag.AlignCenter)
+        color_layout.addWidget(QLabel("Brightness"))
+        self.brightness = QSlider(Qt.Orientation.Horizontal)
+        self.brightness.setRange(0, 100)
+        self.brightness.sliderPressed.connect(self.remember)
+        self.brightness.valueChanged.connect(self.inline_brightness)
+        color_layout.addWidget(self.brightness)
+        self.fill_button = QLabel()
+        color_layout.addWidget(self.fill_button)
+        self.button(color_layout, "Save color", self.save_color)
+
+        color_layout.addWidget(QLabel("Saved colors — click to apply"))
+
+        self.palette = QListWidget()
+        self.palette.setMaximumHeight(60)
+        self.palette.itemClicked.connect(self.apply_saved_color)
+        color_layout.addWidget(self.palette)
+        color_layout.addStretch()
+
+        line_tab = QWidget()
+        line_layout = QVBoxLayout(line_tab)
+        tabs.addTab(line_tab, "Line")
+
+        self.controls = {}
+        self.sliders = {}
+
+        for title, key, minimum, maximum in [
+            ("Angle", "angle", -180, 180),
+            ("Length / circle diameter", "length", 1, 1400),
+            ("Thickness", "width", 2, 160),
+        ]:
+            line_layout.addWidget(QLabel(title))
+
+            control = QSpinBox()
+            control.setRange(minimum, maximum)
+            control.setKeyboardTracking(False)
+            control.valueChanged.connect(
+                lambda value, name=key: self.set_line_value(name, value)
+            )
+
+            self.controls[key] = control
+            line_layout.addWidget(control)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(minimum, maximum)
+            slider.sliderPressed.connect(self.remember)
+            slider.valueChanged.connect(lambda value, name=key: self.slider_value(name, value))
+            self.sliders[key] = slider
+            line_layout.addWidget(slider)
+
+        self.rounded = QCheckBox("Rounded ends")
+        self.rounded.toggled.connect(
+            lambda value: self.set_line_value("rounded", value)
+        )
+        line_layout.addWidget(self.rounded)
+        line_layout.addStretch()
+
+        canvas_tab = QWidget()
+        canvas_layout = QVBoxLayout(canvas_tab)
+        tabs.addTab(canvas_tab, "Canvas")
+        tabs.addTab(layers_tab, "Layers")
+
+        self.button(
+            canvas_layout, "Background color", self.choose_background
+        )
+
+        self.transparent_checkbox = QCheckBox("Transparent background")
+        self.transparent_checkbox.toggled.connect(self.set_transparent)
+        canvas_layout.addWidget(self.transparent_checkbox)
+        canvas_layout.addStretch()
+
+        self.setStyleSheet("""
+            QWidget { color: #f5f5f7; font-family: Helvetica, Arial;
+                      font-size: 13px; }
+            QMainWindow, QWidget#app { background: #101116; }
+            QWidget#panel { background: #191a21; border: 1px solid #303139; border-radius: 12px; }
+            QLabel { background: transparent; }
+            QLabel#title { font-size: 23px; font-weight: bold; }
+            QLabel#brand { background: #c2ff62; color: #152007; border-radius: 10px;
+                           font-size: 26px; font-weight: bold; }
+            QLabel#muted { color: #a3a5b1; }
+            QLabel#section { font-size: 16px; font-weight: bold; }
+            QPushButton { background: #23242d; border: 1px solid #3a3b46;
+                          border-radius: 7px; padding: 8px 10px; }
+            QPushButton:hover { background: #343640; border-color: #777b88; }
+            QPushButton:pressed, QPushButton:checked { background: #344325; border-color: #c2ff62; color: #c2ff62; }
+            QPushButton#primary { background: #c2ff62; color: #152007; border: none; font-weight: bold; }
+            QPushButton#primary:hover { background: #d4ff93; }
+            QPushButton:disabled { color: #686a77; border-color: #303139; }
+            QLineEdit, QSpinBox { background: #101116; border: 1px solid #3a3b46;
+                                border-radius: 6px; padding: 7px; selection-background-color: #47652b; }
+            QLineEdit:focus, QSpinBox:focus { border-color: #c2ff62; }
+            QListWidget { background: #101116; border: 1px solid #303139; border-radius: 7px; padding: 4px; }
+            QListWidget::item { padding: 7px; border-radius: 4px; }
+            QListWidget::item:selected { background: #344325; color: #c2ff62; }
+            QTabWidget::pane { border: 0; background: #191a21; }
+            QTabBar::tab { background: #101116; color: #a3a5b1; padding: 9px 10px; margin-bottom: 8px; }
+            QTabBar::tab:selected { background: #343640; color: white; border-bottom: 2px solid #c2ff62; }
+            QSlider::groove:horizontal { height: 6px; background: #343640; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #c2ff62; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #c2ff62; width: 16px; margin: -5px 0; border-radius: 8px; }
+            QCheckBox { spacing: 8px; padding: 6px 0; }
+            QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #737684; border-radius: 4px; }
+            QCheckBox::indicator:checked { background: #c2ff62; border-color: #c2ff62; }
+        """)
+        self.refresh()
+
+    @staticmethod
+    def button(layout, title, action):
+        button = QPushButton(title)
+        button.clicked.connect(action)
+        layout.addWidget(button)
+        return button
+
+    def by_id(self, line_id):
+        return next(
+            (line for line in self.lines if line["id"] == line_id),
+            None,
+        )
+
+    def current(self):
+        return self.by_id(self.selected)
+
+    def remember(self):
+        self.history.append(
+            copy.deepcopy(
+                (
+                    self.lines,
+                    self.fills,
+                    self.selected,
+                    self.next_id,
+                    self.background,
+                    self.transparent,
+                )
+            )
+        )
+        self.history = self.history[-60:]
+
+    def undo(self):
+        if not self.history:
+            return
+
+        (
+            self.lines,
+            self.fills,
+            self.selected,
+            self.next_id,
+            self.background,
+            self.transparent,
+        ) = self.history.pop()
+
+        self.refresh()
+
+    def new_line(self, x=512, y=512, length=400):
+        line = {
+            "id": self.next_id,
+            "name": f"Line {self.next_id}",
+            "x": x,
+            "y": y,
+            "length": length,
+            "angle": 0,
+            "width": 40,
+            "color": "#242738",
+            "rounded": True,
+            "hidden": False,
+            "locked": False,
+        }
+
+        self.next_id += 1
+        self.lines.append(line)
+        self.selected = line["id"]
+        self.refresh()
+        return line
+
+    def slider_value(self, key, value):
+        if self.updating:
+            return
+        line = self.current()
+        if line and not line["locked"]:
+            if not self.sliders[key].isSliderDown():
+                self.remember()
+            line[key] = value
+            self.refresh()
+
+    def add_circle(self):
+        self.remember()
+        circle = self.new_line()
+        circle.update(kind="circle", name=f"Circle {circle['id']}")
+        self.canvas.mode = "select"
+        self.paint_button.setChecked(False)
+        self.refresh()
+
+    def add_line(self):
+        self.remember()
+        self.new_line()
+        self.canvas.mode = "select"
+        self.paint_button.setChecked(False)
+
+    def draw_mode(self):
+        self.canvas.mode = "draw"
+        self.paint_button.setChecked(False)
+        self.status.setText("Drag on the canvas to draw a line.")
+
+    def paint_mode(self):
+        self.canvas.mode = (
+            "paint" if self.paint_button.isChecked() else "select"
+        )
+        self.status.setText(
+            "Click inside a closed shape to fill it."
+            if self.canvas.mode == "paint"
+            else "Select or move a line."
+        )
+
+    def duplicate(self):
+        line = self.current()
+
+        if line is None or line["locked"]:
+            return
+
+        self.remember()
+        new = copy.deepcopy(line)
+        new["id"] = self.next_id
+        new["name"] = f"Line {self.next_id}"
+        new["x"] += 35
+        new["y"] += 35
+
+        self.next_id += 1
+        self.lines.append(new)
+        self.selected = new["id"]
+        self.refresh()
+
+    def delete_line(self):
+        line = self.current()
+
+        if line is None or line["locked"]:
+            return
+
+        self.remember()
+        self.lines.remove(line)
+        self.selected = self.lines[-1]["id"] if self.lines else None
+        self.refresh()
+
+    def rotate(self, amount):
+        line = self.current()
+
+        if line is None or line["locked"]:
+            return
+
+        self.remember()
+        line["angle"] = (line["angle"] + amount + 180) % 360 - 180
+        self.refresh()
+
+    def select_layer(self, item):
+        self.selected = item.data(Qt.ItemDataRole.UserRole)
+        self.refresh()
+
+    def rename_layer(self):
+        line = self.current()
+
+        if line is None:
+            return
+
+        name = self.layer_name.text().strip()[:60]
+        name = name or f"Line {line['id']}"
+
+        if name != line["name"]:
+            self.remember()
+            line["name"] = name
+            self.refresh()
+
+    def toggle_hidden(self):
+        line = self.current()
+
+        if line:
+            self.remember()
+            line["hidden"] = not line["hidden"]
+            self.refresh()
+
+    def toggle_locked(self):
+        line = self.current()
+
+        if line:
+            self.remember()
+            line["locked"] = not line["locked"]
+            self.refresh()
+
+    def reorder(self, direction):
+        line = self.current()
+
+        if line is None or line["locked"]:
+            return
+
+        index = self.lines.index(line)
+        target = index + direction
+
+        if 0 <= target < len(self.lines):
+            self.remember()
+            self.lines[index], self.lines[target] = (
+                self.lines[target],
+                self.lines[index],
+            )
+            self.refresh()
+
+    def apply_inline_color(self):
+        if self.updating:
+            return
+        color = self.color_wheel.color().name()
+        line = self.current()
+        if self.wheel_fill.isChecked() or self.canvas.mode == "paint" or line is None:
+            self.fill_color = color
+        elif not line["locked"]:
+            line["color"] = color
+        self.refresh()
+
+    def inline_brightness(self, value):
+        if not self.updating:
+            self.color_wheel.value = value / 100
+            self.apply_inline_color()
+
+    def choose_line_color(self):
+        line = self.current()
+
+        if line is None or line["locked"]:
+            return
+
+        color = choose_wheel_color(
+            QColor(line["color"]), self, "Line color"
+        )
+
+        if color.isValid():
+            self.remember()
+            line["color"] = color.name()
+            self.refresh()
+
+    def choose_fill_color(self):
+        color = choose_wheel_color(
+            QColor(self.fill_color), self, "Fill color"
+        )
+
+        if color.isValid():
+            self.fill_color = color.name()
+            self.refresh()
+
+    def save_color(self):
+        line = self.current()
+        color = (
+            self.fill_color
+            if self.wheel_fill.isChecked() or self.canvas.mode == "paint" or line is None
+            else line["color"]
+        )
+
+        if color not in self.saved_colors:
+            self.saved_colors.append(color)
+
+        try:
+            COLOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+            COLOR_FILE.write_text(json.dumps(self.saved_colors))
+            self.status.setText("Color saved.")
+        except OSError:
+            self.status.setText("Color saved for this session only.")
+
+        self.refresh()
+
+    def apply_saved_color(self, item):
+        color = item.data(Qt.ItemDataRole.UserRole)
+
+        if self.wheel_fill.isChecked() or self.canvas.mode == "paint":
+            self.fill_color = color
+            self.refresh()
+            return
+
+        line = self.current()
+
+        if line and not line["locked"]:
+            self.remember()
+            line["color"] = color
+            self.refresh()
+
+    def set_line_value(self, key, value):
+        if self.updating:
+            return
+
+        line = self.current()
+
+        if line and not line["locked"] and line[key] != value:
+            self.remember()
+            line[key] = value
+            self.canvas.update()
+
+    def set_transparent(self, value):
+        if self.updating:
+            return
+
+        self.remember()
+        self.transparent = value
+        self.canvas.update()
+
+    def choose_background(self):
+        color = choose_wheel_color(
+            QColor(self.background), self, "Background color"
+        )
+
+        if color.isValid():
+            self.remember()
+            self.background = color.name()
+            self.canvas.update()
+
+    def clear_fills(self):
+        if self.fills or any(line.get("fill") for line in self.lines):
+            self.remember()
+            self.fills = {}
+            for line in self.lines:
+                line.pop("fill", None)
+            self.refresh()
+
+    def refresh(self):
+        self.updating = True
+        self.layer_list.clear()
+
+        for line in reversed(self.lines):
+            title = line["name"]
+
+            if line["hidden"]:
+                title += "  [hidden]"
+            if line["locked"]:
+                title += "  [locked]"
+
+            item = QListWidgetItem(title)
+            item.setData(Qt.ItemDataRole.UserRole, line["id"])
+            self.layer_list.addItem(item)
+
+            if line["id"] == self.selected:
+                self.layer_list.setCurrentItem(item)
+
+        line = self.current()
+        self.layer_name.setText(line["name"] if line else "")
+        editable = line is not None and not line["locked"]
+
+        for key, control in self.controls.items():
+            enabled = editable and not (key == "angle" and line.get("kind") == "circle")
+            control.setEnabled(enabled)
+            self.sliders[key].setEnabled(enabled)
+            if line:
+                control.setValue(round(line[key]))
+                self.sliders[key].setValue(round(line[key]))
+
+        self.rounded.setEnabled(editable)
+
+        if line:
+            self.rounded.setChecked(line["rounded"])
+
+        self.transparent_checkbox.setChecked(self.transparent)
+
+        self.palette.clear()
+
+        for color in self.saved_colors:
+            item = QListWidgetItem(color.upper())
+            item.setData(Qt.ItemDataRole.UserRole, color)
+            item.setBackground(QColor(color))
+            item.setForeground(
+                QColor("#111111")
+                if QColor(color).lightness() > 130
+                else QColor("#ffffff")
+            )
+            self.palette.addItem(item)
+
+        color = QColor(self.fill_color if self.wheel_fill.isChecked() or self.canvas.mode == "paint" or line is None else line["color"])
+        hue = color.hsvHueF()
+        if hue >= 0:
+            self.color_wheel.hue = hue
+        self.color_wheel.saturation = color.hsvSaturationF()
+        self.color_wheel.value = color.valueF()
+        self.brightness.setValue(round(color.valueF() * 100))
+        self.color_wheel.update()
+        self.fill_button.setText(color.name().upper())
+        self.fill_button.setStyleSheet(f"border-bottom: 4px solid {color.name()};")
+
+        self.updating = False
+        self.canvas.update()
+
+    def export_png(self):
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export logo",
+            "channel-logo.png",
+            "PNG images (*.png)",
+        )
+
+        if not filename:
+            return
+
+        if not filename.lower().endswith(".png"):
+            filename += ".png"
+
+        image = QImage(
+            CANVAS_SIZE,
+            CANVAS_SIZE,
+            QImage.Format.Format_ARGB32,
+        )
+        image.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.canvas.draw_logo(painter)
+        painter.end()
+
+        if image.save(filename, "PNG"):
+            self.status.setText(f"Exported {filename}")
+        else:
+            QMessageBox.warning(
+                self, "Export failed", "The PNG could not be saved."
+            )
+
+    def project_data(self):
+        return {"format": "SnapMark", "version": 1, "lines": self.lines,
+                "fills": self.fills, "background": self.background,
+                "transparent": self.transparent, "fill_color": self.fill_color}
+
+    def load_project_data(self, data):
+        if not isinstance(data, dict) or data.get("format") != "SnapMark" or data.get("version") != 1:
+            raise ValueError("This is not a supported SnapMark project.")
+        lines = copy.deepcopy(data["lines"])
+        if not isinstance(lines, list) or len(lines) > 5000:
+            raise ValueError("Invalid object list.")
+        ids = set()
+        for line in lines:
+            if not isinstance(line, dict) or type(line.get("id")) is not int or line["id"] in ids:
+                raise ValueError("Invalid object ID.")
+            ids.add(line["id"])
+            if line.get("kind", "line") not in ("line", "circle") or not isinstance(line.get("name"), str):
+                raise ValueError("Invalid object.")
+            for key in ("x", "y", "length", "angle", "width"):
+                value = line.get(key)
+                if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 100000:
+                    raise ValueError("Invalid dimensions.")
+            if line["length"] <= 0 or line["width"] <= 0:
+                raise ValueError("Dimensions must be positive.")
+            for key in ("hidden", "locked", "rounded"):
+                if type(line.get(key)) is not bool:
+                    raise ValueError("Invalid object setting.")
+            for key in ("color", "fill"):
+                if key in line and (not isinstance(line[key], str) or not QColor(line[key]).isValid()):
+                    raise ValueError("Invalid color.")
+        fills = data.get("fills", {})
+        if not isinstance(fills, dict) or any(not isinstance(v, str) or not QColor(v).isValid() for v in fills.values()):
+            raise ValueError("Invalid fills.")
+        for key in ("background", "fill_color"):
+            if not isinstance(data.get(key), str) or not QColor(data[key]).isValid():
+                raise ValueError("Invalid project color.")
+        if type(data.get("transparent")) is not bool:
+            raise ValueError("Invalid background setting.")
+        self.remember()
+        self.lines, self.fills = lines, copy.deepcopy(fills)
+        self.background, self.transparent = data["background"], data["transparent"]
+        self.fill_color = data["fill_color"]
+        self.next_id = max(ids, default=0) + 1
+        self.selected = lines[-1]["id"] if lines else None
+        self.canvas.drag = None
+        self.canvas.mode = "select"
+        self.paint_button.setChecked(False)
+        self.refresh()
+
+    def save_project(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Save Project", "SnapMark.snapmark", "SnapMark project (*.snapmark)")
+        if not filename:
+            return
+        if not filename.lower().endswith(".snapmark"):
+            filename += ".snapmark"
+        try:
+            target = Path(filename)
+            temporary = target.with_name(target.name + ".tmp")
+            temporary.write_text(json.dumps(self.project_data(), indent=2), encoding="utf-8")
+            temporary.replace(target)
+            self.status.setText("Project saved. Use Open Project to edit it later.")
+        except OSError as error:
+            QMessageBox.warning(self, "Save failed", str(error))
+
+    def open_project(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "SnapMark project (*.snapmark)")
+        if not filename:
+            return
+        if self.lines and QMessageBox.question(self, "Open Project", "Replace the current drawing? Save it first if you want to keep it.") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.load_project_data(json.loads(Path(filename).read_text(encoding="utf-8")))
+            self.status.setText("Project opened.")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            QMessageBox.warning(self, "Open failed", str(error))
+
+    def closeEvent(self, event):
+        if not self.lines:
+            event.accept()
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Close SnapMark?",
+            "Close this drawing? Use Save Project to keep it editable, or Export PNG for an image.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+        )
+
+        if answer == QMessageBox.StandardButton.Yes:
+            event.accept()
+        else:
+            event.ignore()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("SnapMark")
+
+    window = SnapMark()
+    window.show()
+
+    sys.exit(app.exec())
